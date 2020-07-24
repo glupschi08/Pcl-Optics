@@ -32,13 +32,108 @@
 #include <random>
 #include "Optics.hpp"
 
+
+#include <cxxopts.hpp>
+
+//added for filtering
+#include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+
+
+
+std::tuple<uint8_t, uint8_t, uint8_t> jet(double x){
+    const double rone = 0.8;
+    const double gone = 1.0;
+    const double bone = 1.0;
+    double r, g, b;
+
+    x = (x < 0 ? 0 : (x > 1 ? 1 : x));
+
+    if (x < 1. / 8.) {
+        r = 0;
+        g = 0;
+        b = bone * (0.5 + (x) / (1. / 8.) * 0.5);
+    } else if (x < 3. / 8.) {
+        r = 0;
+        g = gone * (x - 1. / 8.) / (3. / 8. - 1. / 8.);
+        b = bone;
+    } else if (x < 5. / 8.) {
+        r = rone * (x - 3. / 8.) / (5. / 8. - 3. / 8.);
+        g = gone;
+        b = (bone - (x - 3. / 8.) / (5. / 8. - 3. / 8.));
+    } else if (x < 7. / 8.) {
+        r = rone;
+        g = (gone - (x - 5. / 8.) / (7. / 8. - 5. / 8.));
+        b = 0;
+    } else {
+        r = (rone - (x - 7. / 8.) / (1. - 7. / 8.) * 0.5);
+        g = 0;
+        b = 0;
+    }
+    return std::make_tuple(uint8_t(255.*r), uint8_t(255.*g), uint8_t(255.*b));
+}
+
+
+//does the prescalling for jet -> maps z to [0-1]:[1-0] in the area between 0 and threshold
+//e.g. points along a linear line in z direction would get be: blue, green, yellow, red, yellow, green, blue, green,...
+std::tuple<uint8_t, uint8_t, uint8_t> stacked_jet(double z, double threshold){
+    pcl::PointXYZRGB pointrgb;
+    std::tuple<uint8_t, uint8_t, uint8_t> colors_rgb;
+    double r, g, b, val;
+    if(z<=0){
+        while(z<0){
+            z+=threshold;
+        }
+    }else{
+        while(z>threshold){
+            z-=threshold;
+        }
+    }
+    if(z>threshold/2){
+        z-=(threshold/2);
+        val=-((z/(threshold/2))-1);
+    }else{
+        val=z/(threshold/2);
+    }
+    //std::cout << "new z: " << z  << "   val: " << val <<std::endl;
+    //std::cout << "val: " << val << std::endl;
+    //colors_rgb = jet(z/(threshold);
+    return jet(val);
+    //return std::make_tuple(uint8_t(255.*0), uint8_t(255.*0), uint8_t(255.*0));
+}
+
+
 int main(int argc, char* argv[]) {
 
-    if(argc < 2)
-    {
-        std::cerr << "Usage : " << argv[0] << " <filename>" << std::endl;
-        return EXIT_FAILURE;
+    std::string path_str;
+    int filter_flag=0;
+    int show;
+    float filter_leaf_size;
+    int max_it, min_pts;
+    double distance_threshold, reachability_threshold;
+    cxxopts::Options options("MyProgram", "One line description of MyProgram");
+    options.add_options()
+            ("help", "Print help")
+            ("f,filter", "set to 1 for filtering", cxxopts::value<int>(filter_flag)->default_value("0"))
+            ("s,show", "show visualization", cxxopts::value<int>(show)->default_value("0"))
+            ("input_file", "Input pcd file", cxxopts::value(path_str))
+            ("m,max_it", "max iterations", cxxopts::value<int>(max_it)->default_value("100"))
+            ("l,filter_leaf_size", "filter_leaf_size", cxxopts::value<float>(filter_leaf_size)->default_value("0.01"))
+            ("t,distance_threshold", "distance_threshold", cxxopts::value<double>(distance_threshold)->default_value("0.02"))
+            ("p,min_pts", "optics: min_pts", cxxopts::value<int>(min_pts)->default_value("10"))
+            ("r,reachability_threshold", "optics: reachability_threshold", cxxopts::value<double>(reachability_threshold)->default_value("0.05"));
+
+    auto result = options.parse(argc, argv);
+    if (result.count("help")) {
+        cout << options.help({ "", "Group" }) << endl;
+        exit(0);
     }
+
+    std::cout << "input_file: " << path_str << std::endl;
+    std::cout << "max_it: " << max_it << std::endl;
+    std::cout << "distance_threshold: " << distance_threshold << std::endl;
+    std::cout << "min_pts: " << min_pts << std::endl;
+    std::cout << "reachability_threshold: " << reachability_threshold << std::endl;
 
     std::mt19937 t(std::chrono::system_clock::now().time_since_epoch().count());
     std::uniform_int_distribution<unsigned int> rgb(1, 255);
@@ -48,98 +143,100 @@ int main(int argc, char* argv[]) {
             bufferCloud(new pcl::PointCloud<pcl::PointXYZ>),
             filteredCloud(new pcl::PointCloud<pcl::PointXYZ>),
             indicesCloud(new pcl::PointCloud<pcl::PointXYZ>);
-    reader.read(argv[1], *cloud);
+
+
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr indicesCloud_RGB(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    reader.read(path_str, *cloud);
     std::cout << "PointCloud before filtering has: " << cloud->points.size() << " data points." << std::endl;
 
-    pcl::VoxelGrid<pcl::PointXYZ> vg;
-    vg.setInputCloud(cloud);
-    vg.setLeafSize(0.01f, 0.01f, 0.01f);
-    vg.filter(*filteredCloud);
-    std::cout << "PointCloud after filtering has: " << filteredCloud->points.size() << " data points." << std::endl;
+    //do some filtering on the cloud to remove outliers
+    // Create the filtering object for RadiusOutlierRemoval
+    pcl::RadiusOutlierRemoval<pcl::PointXYZ> outrem;
+    outrem.setRadiusSearch(5.);//good 5 and r = 3//0.8
+    outrem.setMinNeighborsInRadius (4);//2
+    std::cerr << "Cloud after StatisticalOutlierRemoval: " <<cloud->size()<< std::endl;
+    outrem.setInputCloud(cloud);
+    outrem.filter (*filteredCloud);
+    std::cerr << "Cloud after RadiusOutlierRemoval: " <<filteredCloud->size()<< std::endl;
 
-    pcl::SACSegmentation<pcl::PointXYZ> seg;
-    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_plane(new pcl::PointCloud<pcl::PointXYZ>());
-    pcl::PCDWriter writer;
-    seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PLANE);
-    seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setMaxIterations(100);
-    seg.setDistanceThreshold(0.02);
 
-    int nr_points = (int) filteredCloud->points.size();
-    while (filteredCloud->points.size() > 0.3 * nr_points) {
-        seg.setInputCloud(filteredCloud);
-        seg.segment(*inliers, *coefficients);
-        if (inliers->indices.empty()) {
-            std::cout << "Could not estimate a planar model for the given dataset." << std::endl;
-            break;
-        }
-        pcl::ExtractIndices<pcl::PointXYZ> extract;
-        extract.setInputCloud(filteredCloud);
-        extract.setIndices(inliers);
-        extract.setNegative(false);
-        extract.filter(*cloud_plane);
-        std::cout << "PointCloud representing the planar component: " << cloud_plane->points.size() << " data points."
-                  << std::endl;
-        extract.setNegative(true);
-        extract.filter(*bufferCloud);
-        *filteredCloud = *bufferCloud;
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr filteredCloud_Color(new pcl::PointCloud<pcl::PointXYZRGB>);
+    copyPointCloud(*filteredCloud, *filteredCloud_Color);
+    double jet_stacking_threshold=1.;
+    for (std::size_t i = 0; i < filteredCloud_Color->points.size (); ++i){
+        pcl::PointXYZRGB pointrgb;
+        std::tuple<uint8_t, uint8_t, uint8_t> colors_rgb;
+        colors_rgb = stacked_jet( filteredCloud_Color->points[i].z, jet_stacking_threshold);
+
+        std::uint32_t rgb = (static_cast<std::uint32_t>(std::get<0>(colors_rgb)) << 16 |
+                             static_cast<std::uint32_t>(std::get<1>(colors_rgb)) << 8 |
+                             static_cast<std::uint32_t>(std::get<2>(colors_rgb)));
+        pointrgb.rgb = *reinterpret_cast<float*>(&rgb);
+        filteredCloud_Color->points[i].r = pointrgb.r;
+        filteredCloud_Color->points[i].g = pointrgb.g;
+        filteredCloud_Color->points[i].b = pointrgb.b;
     }
+    std::cerr << "filteredCloud_Color: " <<filteredCloud_Color->size()<< std::endl;
 
-    const unsigned int size = std::floor(filteredCloud->size() / 2);
+    const unsigned int size = std::floor(filteredCloud_Color->size() / 2);
     pcl::IndicesPtr indices(new std::vector<int>(size));
     std::iota(std::begin(*indices),
               std::end(*indices),
               size);
 
     std::vector<pcl::PointIndicesPtr> clusters;
-    Optics::optics<pcl::PointXYZ>(filteredCloud, indices, 10, 0.05, clusters);
+    std::cout << "min_pts: " << min_pts << std::endl;
+    std::cout << "reachability_threshold: " << reachability_threshold << std::endl;
+    //Optics::optics<pcl::PointXYZ>(filteredCloud, indices, min_pts, reachability_threshold, clusters);
+    Optics::optics<pcl::PointXYZRGB>(filteredCloud_Color, indices, min_pts, reachability_threshold, clusters);
+    std::cout << "Cluster size:" << clusters.size() << std::endl;
 
-    int v0{0}, v1{1}, v2{2};
+    //int v0{0}, v1{1}, v2{2};
     pcl::visualization::PCLVisualizer viewer("Visualizer");
-    viewer.setSize(1280, 1024);
+    //sviewer.setSize(1280, 1024);
     viewer.setShowFPS(true);
 
-    viewer.createViewPort(0.0, 0.0, 0.60, 0.5, v0);
-    viewer.setBackgroundColor(0.3,0.3,0.3, v0);
-    viewer.createViewPort(0.0, 0.5, 0.60, 1.0, v1);
-    viewer.setBackgroundColor(0.0,0.0,0.0, v1);
-    viewer.createViewPort(0.60, 0.0, 1.0, 1.0, v2);
-    viewer.setBackgroundColor(0.0,0.0,0.0, v2);
 
-    {
-        pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color(filteredCloud, rgb(t), rgb(t), rgb(t));
-        viewer.addPointCloud(filteredCloud, color, "filteredCloud", v0);
-        viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "filteredCloud", v0);
-    }
+    //pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color_1(filteredCloud, rgb(t), rgb(t), rgb(t));
+    //viewer.addPointCloud(filteredCloud, color_1, "filteredCloud");
+    //viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "filteredCloud");
 
-    {
+
+/*
         pcl::ExtractIndices<pcl::PointXYZ> extract;
-        extract.setInputCloud(filteredCloud);
+        extract.setInputCloud(filteredCloud_Color);
         extract.setIndices(indices);
         extract.setNegative(false);
-        extract.filter(*indicesCloud);
+        extract.filter(*indicesCloud_RGB);
+*/
+    pcl::ExtractIndices<pcl::PointXYZRGB> extractRGB;
+    extractRGB.setInputCloud(filteredCloud_Color);
+    extractRGB.setIndices(indices);
+    extractRGB.setNegative(false);
+    extractRGB.filter(*indicesCloud_RGB);
+        //pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color(clusterCloud, rgb(t), rgb(t), rgb(t));
+        //pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color_2(indicesCloud, rgb(t), rgb(t), rgb(t));
+        //viewer.addPointCloud(indicesCloud, color_2, "indicesCloud");
+        viewer.addPointCloud(indicesCloud_RGB, "indicesCloud");
 
-        pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color(indicesCloud, rgb(t), rgb(t), rgb(t));
-        viewer.addPointCloud(indicesCloud, color, "indicesCloud", v2);
-        viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "indicesCloud", v2);
-    }
+      viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "indicesCloud");
+
 
     unsigned int id = 0;
     for (const auto &c : clusters) {
+        //std::cout << "Cluster " << id << " size is : " << c->indices.size() << std::endl;
         if (c->indices.size() < 10) continue;
-
         std::cout << "Cluster " << id << " size is : " << c->indices.size() << std::endl;
+
         pcl::PointCloud<pcl::PointXYZ>::Ptr clusterCloud(new pcl::PointCloud<pcl::PointXYZ>);
         for (const auto &index : c->indices) {
             clusterCloud->push_back((*filteredCloud)[index]);
         }
         pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> color(clusterCloud, rgb(t), rgb(t), rgb(t));
         std::string strid = "cloud_cluster_" + std::to_string(id++);
-        viewer.addPointCloud(clusterCloud, color, strid, v1);
-        viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 3, strid, v1);
+        viewer.addPointCloud(clusterCloud, color, strid);
+        viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 4, strid);
     }
 
     while (!viewer.wasStopped()) {
