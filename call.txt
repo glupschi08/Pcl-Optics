@@ -1,1 +1,2 @@
+./Pcl_Optics_With_Indices --input_file=../../../data/keypoints__visualize_temp_4.pcd --reachability_threshold=30. --min_pts=30
 ./Pcl_Optics --input_file=../../../data/keypoints__visualize_temp_4.pcd --reachability_threshold=30. --min_pts=30
